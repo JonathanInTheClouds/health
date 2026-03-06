@@ -1,0 +1,11 @@
+FROM registry.access.redhat.com/ubi9/openjdk-17
+
+USER 0
+WORKDIR /app
+COPY TcpClient.java /app/TcpClient.java
+RUN chown -R 185:0 /app && chmod -R g+rwX /app
+
+USER 185
+RUN javac /app/TcpClient.java
+
+CMD ["java", "-cp", "/app", "TcpClient"]

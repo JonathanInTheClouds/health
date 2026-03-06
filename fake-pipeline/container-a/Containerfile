@@ -1,0 +1,7 @@
+FROM registry.access.redhat.com/ubi9/python-311
+
+WORKDIR /app
+COPY server.py /app/server.py
+
+ENV PYTHONUNBUFFERED=1
+CMD ["python", "/app/server.py"]

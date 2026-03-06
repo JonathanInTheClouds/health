@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+A=""
+B=""
+PORT=""
+REFRESH="1"
+LOG_MODE="b"   # a|b|none
+TAIL="10"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --a) A="${2:-}"; shift 2 ;;
+    --b) B="${2:-}"; shift 2 ;;
+    --port) PORT="${2:-}"; shift 2 ;;
+    --refresh) REFRESH="${2:-}"; shift 2 ;;
+    --logs) LOG_MODE="${2:-}"; shift 2 ;;
+    --tail) TAIL="${2:-}"; shift 2 ;;
+    -h|--help)
+      cat <<USAGE
+Usage:
+  ./pipeline-top --a container-a --b container-b --port 5000 [--refresh 1] [--logs a|b|none] [--tail 10]
+USAGE
+      exit 0
+      ;;
+    *)
+      echo "Unknown arg: $1"
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$A" || -z "$B" || -z "$PORT" ]]; then
+  echo "Usage: ./pipeline-top --a container-a --b container-b --port 5000"
+  exit 1
+fi
+
+for cmd in podman tput awk sed grep date uname tail; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Missing command: $cmd"; exit 1; }
+done
+
+NET_TOOL=""
+NET_SCOPE="host"   # host | podman-machine
+
+if command -v ss >/dev/null 2>&1; then
+  NET_TOOL="ss"
+  NET_SCOPE="host"
+elif command -v netstat >/dev/null 2>&1; then
+  NET_TOOL="netstat"
+  if podman machine info >/dev/null 2>&1; then
+    NET_SCOPE="podman-machine"
+  else
+    NET_SCOPE="host"
+  fi
+else
+  echo "Missing command: ss or netstat"
+  exit 1
+fi
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]]; then
+  echo "PORT must be numeric"
+  exit 1
+fi
+
+if ! [[ "$TAIL" =~ ^[0-9]+$ ]]; then
+  echo "TAIL must be numeric"
+  exit 1
+fi
+
+# Dedicated terminal input fd
+exec 3</dev/tty
+
+# Save tty state so we can restore it exactly
+TTY_OLD="$(stty -g < /dev/tty)"
+
+cleanup() {
+  tput sgr0 2>/dev/null || true
+  tput cnorm 2>/dev/null || true
+  stty "$TTY_OLD" < /dev/tty 2>/dev/null || true
+  exec 3<&- 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+tput civis
+stty -echo -icanon min 0 time 0 < /dev/tty
+
+if [[ -t 1 ]]; then
+  RED="$(tput setaf 1)"
+  GREEN="$(tput setaf 2)"
+  YELLOW="$(tput setaf 3)"
+  CYAN="$(tput setaf 6)"
+  BOLD="$(tput bold)"
+  RESET="$(tput sgr0)"
+else
+  RED=""
+  GREEN=""
+  YELLOW=""
+  CYAN=""
+  BOLD=""
+  RESET=""
+fi
+
+rows() { tput lines; }
+cols() { tput cols; }
+
+move() { tput cup "$1" "$2"; }
+clear_line() { printf '\033[2K'; }
+
+write_at() {
+  local r="$1" c="$2"
+  shift 2
+  move "$r" "$c"
+  clear_line
+  printf '%s' "$*"
+}
+
+fit() {
+  local text="$1"
+  local width="$2"
+  if (( width < 4 )); then
+    printf '%s' "$text"
+    return
+  fi
+  if (( ${#text} > width )); then
+    printf '%s' "${text:0:width-3}..."
+  else
+    printf '%s' "$text"
+  fi
+}
+
+status_color() {
+  case "$1" in
+    running|LISTENING|ESTABLISHED|HEALTHY|OK|UP)
+      printf '%s%s%s' "$GREEN" "$1" "$RESET"
+      ;;
+    exited|dead|NOT\ LISTENING|NONE|DOWN|BROKEN)
+      printf '%s%s%s' "$RED" "$1" "$RESET"
+      ;;
+    *)
+      printf '%s%s%s' "$YELLOW" "$1" "$RESET"
+      ;;
+  esac
+}
+
+container_state() {
+  podman inspect "$1" --format '{{.State.Status}}' 2>/dev/null || echo "unknown"
+}
+
+container_pid() {
+  podman inspect "$1" --format '{{.State.Pid}}' 2>/dev/null || echo "?"
+}
+
+container_image() {
+  podman inspect "$1" --format '{{.ImageName}}' 2>/dev/null || echo "?"
+}
+
+net_cmd() {
+  if [[ "$NET_SCOPE" == "podman-machine" ]]; then
+    podman machine ssh -- "$@"
+  else
+    "$@"
+  fi
+}
+
+listener_line() {
+  if [[ "$NET_TOOL" == "ss" ]]; then
+    net_cmd ss -ltn 2>/dev/null | awk -v p=":$PORT" '$0 ~ p {print; exit}'
+  else
+    if [[ "$NET_SCOPE" == "podman-machine" ]]; then
+      net_cmd sh -lc "command -v ss >/dev/null 2>&1 && ss -ltn || netstat -an" 2>/dev/null \
+        | awk -v p=":$PORT" '
+            $0 ~ /LISTEN/ && $0 ~ p {print; exit}
+            $0 ~ p && $0 ~ /LISTEN/ {print; exit}
+            $0 ~ p && $1 ~ /LISTEN/ {print; exit}
+          '
+    else
+      netstat -an 2>/dev/null | awk -v p="\\.$PORT[[:space:]]" '
+        /LISTEN/ && $0 ~ p {print; exit}
+      '
+    fi
+  fi
+}
+
+conn_lines() {
+  if [[ "$NET_TOOL" == "ss" ]]; then
+    net_cmd ss -tn 2>/dev/null | awk -v p=":$PORT" '$0 ~ p && $1=="ESTAB"'
+  else
+    if [[ "$NET_SCOPE" == "podman-machine" ]]; then
+      net_cmd sh -lc "command -v ss >/dev/null 2>&1 && ss -tn || netstat -an" 2>/dev/null \
+        | awk -v p=":$PORT" '
+            $0 ~ p && $1=="ESTAB" {print}
+            /ESTABLISHED/ && $0 ~ p {print}
+          '
+    else
+      netstat -an 2>/dev/null | awk -v p="\\.$PORT[[:space:]]" '
+        /ESTABLISHED/ && $0 ~ p {print}
+      '
+    fi
+  fi
+}
+
+sample_estab_line() {
+  conn_lines | awk 'NR==1{print; exit}'
+}
+
+estab_count() {
+  conn_lines | awk 'END{print NR+0}'
+}
+
+stats_line() {
+  podman stats --no-stream \
+    --format '{{.Name}} CPU={{.CPU}} MEM={{.MemUsage}} ({{.MemPerc}}) NET={{.NetIO}} PIDS={{.PIDS}}' \
+    "$1" 2>/dev/null || true
+}
+
+log_lines() {
+  local c="$1"
+  podman logs --tail "$TAIL" "$c" 2>/dev/null || echo "<no logs>"
+}
+
+read_key() {
+  local timeout="${1:-0.1}"
+  local k=""
+  if IFS= read -r -s -n 1 -t "$timeout" -u 3 k 2>/dev/null; then
+    printf '%s' "$k"
+    return 0
+  fi
+  return 1
+}
+
+handle_key() {
+  local key="$1"
+  case "$key" in
+    q) exit 0 ;;
+    a) LOG_MODE="a" ;;
+    b) LOG_MODE="b" ;;
+    l) [[ "$LOG_MODE" == "none" ]] && LOG_MODE="b" || LOG_MODE="none" ;;
+    n) LOG_MODE="none" ;;
+    +) REFRESH="$(awk -v r="$REFRESH" 'BEGIN{r=r-0.2; if(r<0.2) r=0.2; print r}')" ;;
+    -) REFRESH="$(awk -v r="$REFRESH" 'BEGIN{r=r+0.2; print r}')" ;;
+  esac
+}
+
+draw_static() {
+  tput clear
+  write_at 0 0 "${BOLD}${CYAN}pipeline-top${RESET}"
+  write_at 2 0 "${BOLD}CONTAINERS${RESET}"
+  write_at 6 0 "${BOLD}TCP SERVER (A listens on :$PORT)${RESET}"
+  write_at 10 0 "${BOLD}TCP CONNECTION (B -> A)${RESET}"
+  write_at 15 0 "${BOLD}RESOURCE SNAPSHOT${RESET}"
+  write_at 19 0 "${BOLD}PIPELINE HEALTH${RESET}"
+  write_at 25 0 "${BOLD}LOG TAIL${RESET}"
+}
+
+draw_frame() {
+  local now host w
+  now="$(date '+%Y-%m-%d %H:%M:%S')"
+  host="$(uname -n 2>/dev/null || echo '?')"
+  w="$(cols)"
+
+  write_at 0 20 "host=$host  refresh=${REFRESH}s  time=$now  nettool=$NET_TOOL  scope=$NET_SCOPE"
+
+  local a_state b_state a_pid b_pid a_img b_img
+  a_state="$(container_state "$A")"
+  b_state="$(container_state "$B")"
+  a_pid="$(container_pid "$A")"
+  b_pid="$(container_pid "$B")"
+  a_img="$(container_image "$A")"
+  b_img="$(container_image "$B")"
+
+  write_at 3 0 "  A: $(fit "$A" 18)  state=$(status_color "$a_state")  pid=$a_pid"
+  write_at 4 0 "     image=$(fit "$a_img" $(( w - 12 )))"
+  write_at 5 0 "  B: $(fit "$B" 18)  state=$(status_color "$b_state")  pid=$b_pid"
+
+  local ll
+  ll="$(listener_line || true)"
+  if [[ -n "$ll" ]]; then
+    write_at 7 0 "  Port : $PORT"
+    write_at 8 0 "  State: $(status_color "LISTENING")"
+    write_at 9 0 "  Line : $(fit "$ll" $(( w - 9 )))"
+    listen_ok=1
+  else
+    write_at 7 0 "  Port : $PORT"
+    write_at 8 0 "  State: $(status_color "NOT LISTENING")"
+    write_at 9 0 "  Line : -"
+    listen_ok=0
+  fi
+
+  local estab sample
+  estab="$(estab_count)"
+  sample="$(sample_estab_line || true)"
+
+  if (( estab > 0 )); then
+    write_at 11 0 "  State: $(status_color "ESTABLISHED")"
+    write_at 12 0 "  Count: $estab"
+    write_at 13 0 "  Conn : $(fit "$sample" $(( w - 9 )))"
+    write_at 14 0 "  Note : active TCP pipeline"
+    pipe_ok=1
+  else
+    write_at 11 0 "  State: $(status_color "NONE")"
+    write_at 12 0 "  Count: 0"
+    write_at 13 0 "  Conn : -"
+    write_at 14 0 "  Note : no TCP connection on :$PORT"
+    pipe_ok=0
+  fi
+
+  local sa sb
+  sa="$(stats_line "$A")"
+  sb="$(stats_line "$B")"
+  write_at 16 0 "  $(fit "${sa:-$A <no stats>}" $w)"
+  write_at 17 0 "  $(fit "${sb:-$B <no stats>}" $w)"
+  write_at 18 0 ""
+
+  local overall="BROKEN"
+  if [[ "$a_state" == "running" && "$b_state" == "running" && "$listen_ok" -eq 1 && "$pipe_ok" -eq 1 ]]; then
+    overall="HEALTHY"
+  fi
+
+  write_at 20 0 "  A running      : $( [[ "$a_state" == "running" ]] && status_color OK || status_color DOWN )"
+  write_at 21 0 "  B running      : $( [[ "$b_state" == "running" ]] && status_color OK || status_color DOWN )"
+  write_at 22 0 "  A listening    : $( [[ "$listen_ok" -eq 1 ]] && status_color OK || status_color DOWN )"
+  write_at 23 0 "  B -> A TCP     : $( [[ "$pipe_ok" -eq 1 ]] && status_color OK || status_color DOWN )"
+  write_at 24 0 "  OVERALL        : $(status_color "$overall")"
+
+  local log_container="$B"
+  case "$LOG_MODE" in
+    a) log_container="$A" ;;
+    b) log_container="$B" ;;
+    none) log_container="" ;;
+  esac
+
+  local r max_log_rows i idx
+  local line
+  r="$(rows)"
+  max_log_rows=$(( r - 27 ))
+  (( max_log_rows < 1 )) && max_log_rows=1
+
+  write_at 25 0 "${BOLD}LOG TAIL${RESET}  mode=${LOG_MODE}"
+
+  for ((i=26; i<r-1; i++)); do
+    write_at "$i" 0 ""
+  done
+
+  if [[ -n "$log_container" ]]; then
+    idx=26
+    while IFS= read -r line; do
+      write_at "$idx" 0 "  $(fit "$line" $(( w - 2 )))"
+      idx=$((idx + 1))
+      (( idx >= r-1 )) && break
+    done <<LOGEOF
+$(log_lines "$log_container" | tail -n "$max_log_rows")
+LOGEOF
+  else
+    write_at 26 0 "  logs disabled"
+  fi
+
+  write_at $((r-1)) 0 "Keys: q quit | a logs(A) | b logs(B) | l toggle logs | n no logs | + faster | - slower"
+}
+
+draw_static
+
+while true; do
+  draw_frame
+
+  slices="$(awk -v r="$REFRESH" 'BEGIN{
+    s = int((r / 0.1) + 0.999)
+    if (s < 1) s = 1
+    print s
+  }')"
+
+  for ((i=0; i<slices; i++)); do
+    if key="$(read_key 0.1)"; then
+      handle_key "$key"
+      draw_frame
+    fi
+  done
+done
