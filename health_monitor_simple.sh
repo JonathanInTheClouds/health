@@ -36,11 +36,21 @@ get_status() {
     esac
 }
 
-get_stats() {
+get_restart_count() {
     local name="$1"
-    "$CONTAINER_RUNTIME" stats --no-stream --format \
-        "CPU: {{.CPUPerc}}  MEM: {{.MemUsage}}" "$name" 2>/dev/null || echo "CPU: N/A  MEM: N/A"
+    "$CONTAINER_RUNTIME" inspect --format '{{.RestartCount}}' "$name" 2>/dev/null || echo "N/A"
 }
+
+get_exit_code() {
+    local name="$1"
+    "$CONTAINER_RUNTIME" inspect --format '{{.State.ExitCode}}' "$name" 2>/dev/null || echo "N/A"
+}
+
+get_started_at() {
+    local name="$1"
+    "$CONTAINER_RUNTIME" inspect --format '{{.State.StartedAt}}' "$name" 2>/dev/null || echo "N/A"
+}
+
 
 is_listening() {
     "$CONTAINER_RUNTIME" exec "$CONTAINER_A" ss -tlnp 2>/dev/null \
@@ -70,12 +80,16 @@ while true; do
     echo "======================================== $(date '+%Y-%m-%d %H:%M:%S')"
 
     echo "  [$CONTAINER_A]"
-    echo "    Status : $(get_status "$CONTAINER_A")"
-    echo "    $(get_stats "$CONTAINER_A")"
+    echo "    Status    : $(get_status "$CONTAINER_A")"
+    echo "    Started   : $(get_started_at "$CONTAINER_A")"
+    echo "    Restarts  : $(get_restart_count "$CONTAINER_A")"
+    echo "    Exit Code : $(get_exit_code "$CONTAINER_A")"
 
     echo "  [$CONTAINER_B]"
-    echo "    Status : $(get_status "$CONTAINER_B")"
-    echo "    $(get_stats "$CONTAINER_B")"
+    echo "    Status    : $(get_status "$CONTAINER_B")"
+    echo "    Started   : $(get_started_at "$CONTAINER_B")"
+    echo "    Restarts  : $(get_restart_count "$CONTAINER_B")"
+    echo "    Exit Code : $(get_exit_code "$CONTAINER_B")"
 
     echo ""
     echo "  [TCP :$TCP_PORT]"
