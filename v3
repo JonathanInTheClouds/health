@@ -1,0 +1,390 @@
+// ============================================================
+//  message_capture.cpp
+//
+//  Demonstrates Pattern 1: Plain Function Pointer callback.
+//
+//  File is split into three logical sections:
+//    [1] lib.h      — what the library ships to you (simulated here)
+//    [2] capture.h  — your capture layer (MessageStore + writeSomething)
+//    [3] main()     — wires everything together
+//
+//  Compile:
+//    g++ -std=c++17 -pthread -o message_capture message_capture.cpp && ./message_capture
+// ============================================================
+
+#include <cctype>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+// ============================================================
+//  [1]  lib.h  — Simulated library (pretend this is their code)
+// ============================================================
+
+typedef void (*WriterFn)(int messageType, std::ostream*, uint8_t* buf, size_t nbytes);
+
+namespace lib_internal {
+WriterFn g_registeredWriter = nullptr;
+}
+
+void lib_registerWriter(WriterFn fn) {
+lib_internal::g_registeredWriter = fn;
+std::cout << “[LIB] Writer registered.\n”;
+}
+
+void lib_start() {
+if (lib_internal::g_registeredWriter == nullptr) {
+std::cout << “[LIB] No writer registered — nothing to do.\n”;
+return;
+}
+
+```
+std::cout << "[LIB] Starting — will emit 5 messages...\n\n";
+
+auto makeBuffer = [](uint32_t magic,
+                     uint32_t sequence_id,
+                     uint32_t source_id,
+                     const char* payloadStr)
+    -> std::vector<uint8_t>
+{
+    // PreMessage layout (must match your struct exactly)
+    struct Pre {
+        uint32_t magic;
+        uint16_t version;
+        uint16_t flags;
+        uint32_t record_count;
+        uint32_t record_size;
+        uint64_t payload_bytes;
+    } __attribute__((packed));
+
+    // MessageHeader layout (must match your struct exactly)
+    struct Hdr {
+        uint32_t sequence_id;
+        uint32_t source_id;
+        uint64_t timestamp_ns;
+        uint16_t encoding;
+        uint16_t checksum;
+    } __attribute__((packed));
+
+    size_t payloadSize = std::strlen(payloadStr);
+    size_t totalSize   = sizeof(Pre) + sizeof(Hdr) + payloadSize;
+
+    std::vector<uint8_t> buf(totalSize, 0);
+
+    // Fill PreMessage
+    Pre* pre           = reinterpret_cast<Pre*>(buf.data());
+    pre->magic         = magic;
+    pre->version       = 1;
+    pre->flags         = 0x0001;
+    pre->record_count  = 2;
+    pre->record_size   = static_cast<uint32_t>(payloadSize / 2);
+    pre->payload_bytes = payloadSize;
+
+    // Fill MessageHeader (sits directly after PreMessage)
+    Hdr* hdr          = reinterpret_cast<Hdr*>(buf.data() + sizeof(Pre));
+    hdr->sequence_id  = sequence_id;
+    hdr->source_id    = source_id;
+    hdr->timestamp_ns = 0x0000000006F818A1; // fake timestamp
+    hdr->encoding     = 0;
+    hdr->checksum     = 0xBEEF;
+
+    // Fill payload (sits directly after MessageHeader)
+    std::memcpy(buf.data() + sizeof(Pre) + sizeof(Hdr), payloadStr, payloadSize);
+
+    return buf;
+};
+
+struct Emit { int type; uint32_t magic; uint32_t seq; uint32_t src; const char* payload; };
+Emit emits[] = {
+    { 1, 0xAABBCCDD, 1, 10, "telemetry_data_abc" },   // Telemetry
+    { 3, 0x11223344, 2, 20, "event_data_xyz"     },   // Event
+    { 2, 0xDEADBEEF, 3, 30, "diag_payload_001"   },   // Diagnostic
+    { 3, 0x55667788, 4, 20, "event_data_xyz2"    },   // Event (second)
+    { 99,0xFFFFFFFF, 5,  0, "unknown_drop_me"    },   // Unknown — dropped
+};
+
+for (const auto& e : emits) {
+    auto buf = makeBuffer(e.magic, e.seq, e.src, e.payload);
+
+    std::cout << "[LIB] Firing callback — messageType=" << e.type
+              << "  bytes=" << buf.size() << "\n";
+
+    lib_internal::g_registeredWriter(e.type, nullptr, buf.data(), buf.size());
+    std::cout << "\n";
+}
+
+std::cout << "[LIB] Done emitting.\n\n";
+```
+
+}
+
+// ============================================================
+//  [2]  capture.h  — Your capture layer
+// ============================================================
+
+// –– Message types —————————————–
+
+enum class MessageType : int {
+Telemetry  = 1,
+Diagnostic = 2,
+Event      = 3,
+Payload    = 4
+};
+
+inline std::string messageTypeName(int type) {
+switch (static_cast<MessageType>(type)) {
+case MessageType::Telemetry:  return “Telemetry”;
+case MessageType::Diagnostic: return “Diagnostic”;
+case MessageType::Event:      return “Event”;
+case MessageType::Payload:    return “Payload”;
+default:                      return “Unknown”;
+}
+}
+
+// –– Structs ———————————————–
+
+// Renamed from MessageHeader — sits at offset 0 in the buffer
+#pragma pack(push, 1)
+struct PreMessage {
+uint32_t magic;
+uint16_t version;
+uint16_t flags;
+uint32_t record_count;
+uint32_t record_size;
+uint64_t payload_bytes;
+};
+#pragma pack(pop)
+
+// New MessageHeader — sits directly after PreMessage in the buffer
+#pragma pack(push, 1)
+struct MessageHeader {
+uint32_t sequence_id;   // monotonically increasing message counter
+uint32_t source_id;     // identifies which subsystem sent this
+uint64_t timestamp_ns;  // nanosecond timestamp
+uint16_t encoding;      // 0=raw  1=compressed  2=encrypted
+uint16_t checksum;      // simple integrity check
+};
+#pragma pack(pop)
+
+// What we store per captured message
+struct CapturedMessage {
+int                  messageType;
+PreMessage           pre;     // parsed from offset 0
+MessageHeader        header;  // parsed from offset sizeof(PreMessage)
+std::vector<uint8_t> payload; // deep copy — everything after both headers
+};
+
+// –– Buffer dump —————————————––
+//
+// Call this BEFORE memcpy to see the raw bytes in the buffer.
+// Left column = hex values. Right column = ASCII (. for non-printable).
+//
+//  0000  ef be ad de 01 00 01 00 02 00 00 00 …  | …………….
+//
+void dumpBuffer(const uint8_t* buf, size_t nbytes) {
+std::cout << “[DUMP] Raw buffer — “ << nbytes << “ bytes\n”;
+std::cout << std::hex << std::setfill(‘0’);
+
+```
+for (size_t i = 0; i < nbytes; i += 16) {
+    // Byte offset on the left
+    std::cout << "  " << std::setw(4) << i << "  ";
+
+    // Hex columns (up to 16 bytes per row)
+    for (size_t j = 0; j < 16; ++j) {
+        if (i + j < nbytes)
+            std::cout << std::setw(2) << (int)buf[i + j] << " ";
+        else
+            std::cout << "   "; // pad the last short row
+    }
+
+    std::cout << " | ";
+
+    // ASCII columns — printable bytes shown as characters, rest as '.'
+    for (size_t j = 0; j < 16 && i + j < nbytes; ++j) {
+        uint8_t byte = buf[i + j];
+        std::cout << (char)(std::isprint(byte) ? byte : '.');
+    }
+
+    std::cout << "\n";
+}
+
+std::cout << std::dec << std::setfill(' ');
+```
+
+}
+
+// –– MessageStore ——————————————
+
+class MessageStore {
+public:
+static const std::unordered_set<int> knownTypes;
+
+```
+void capture(int messageType, const uint8_t* buf, size_t nbytes) {
+    if (knownTypes.find(messageType) == knownTypes.end()) {
+        std::cout << "[CAPTURE] Dropped unknown messageType=" << messageType << "\n";
+        return;
+    }
+
+    const size_t minSize = sizeof(PreMessage) + sizeof(MessageHeader);
+    if (buf == nullptr || nbytes < minSize) {
+        std::cout << "[CAPTURE] Dropped malformed buffer (too small)\n";
+        return;
+    }
+
+    // --- Peek at the raw bytes before parsing anything ---
+    dumpBuffer(buf, nbytes);
+
+    CapturedMessage msg;
+    msg.messageType = messageType;
+
+    // memcpy #1 — PreMessage sits at offset 0
+    //
+    //  buf: [ PreMessage | MessageHeader | payload... ]
+    //        ^
+    //        offset 0
+    //
+    std::memcpy(&msg.pre, buf, sizeof(PreMessage));
+
+    // memcpy #2 — MessageHeader sits directly after PreMessage
+    //
+    //  buf: [ PreMessage | MessageHeader | payload... ]
+    //                     ^
+    //                     offset = sizeof(PreMessage)
+    //
+    std::memcpy(&msg.header, buf + sizeof(PreMessage), sizeof(MessageHeader));
+
+    // Payload — everything after both headers
+    //
+    //  buf: [ PreMessage | MessageHeader | payload... ]
+    //                                     ^
+    //                                     offset = sizeof(PreMessage) + sizeof(MessageHeader)
+    //
+    const size_t payloadOffset = sizeof(PreMessage) + sizeof(MessageHeader);
+    const size_t payloadSize   = nbytes - payloadOffset;
+
+    if (payloadSize > 0)
+        msg.payload.assign(buf + payloadOffset, buf + payloadOffset + payloadSize);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_[messageType].push_back(std::move(msg));
+
+    std::cout << "[CAPTURE] Stored type=" << messageTypeName(messageType)
+              << "  seq="    << msg.header.sequence_id
+              << "  source=" << msg.header.source_id
+              << "  magic=0x" << std::hex << msg.pre.magic << std::dec
+              << "  payload=" << payloadSize << " bytes\n";
+}
+
+std::vector<CapturedMessage> getMessages(MessageType type) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(static_cast<int>(type));
+    if (it == store_.end()) return {};
+    return it->second;
+}
+
+size_t countOf(MessageType type) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(static_cast<int>(type));
+    return (it != store_.end()) ? it->second.size() : 0;
+}
+
+size_t totalCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    size_t n = 0;
+    for (const auto& kv : store_) n += kv.second.size();
+    return n;
+}
+
+void clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_.clear();
+}
+
+void printSummary(std::ostream& out = std::cout) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    out << "=== MessageStore Summary ===\n";
+    for (const auto& kv : store_) {
+        out << "  [" << kv.first << "] "
+            << messageTypeName(kv.first)
+            << " : " << kv.second.size() << " message(s)\n";
+    }
+    out << "  Total : " << totalCount() << " message(s)\n";
+    out << "============================\n";
+}
+```
+
+private:
+mutable std::mutex                                    mutex_;
+std::unordered_map<int, std::vector<CapturedMessage>> store_;
+};
+
+const std::unordered_set<int> MessageStore::knownTypes = {
+static_cast<int>(MessageType::Telemetry),
+static_cast<int>(MessageType::Diagnostic),
+static_cast<int>(MessageType::Event),
+static_cast<int>(MessageType::Payload)
+};
+
+static MessageStore g_messageStore;
+
+void writeSomething(int messageType, std::ostream* /*unused*/, uint8_t* buf, size_t nbytes) {
+g_messageStore.capture(messageType, buf, nbytes);
+}
+
+std::vector<CapturedMessage> getMessages(MessageType type) {
+return g_messageStore.getMessages(type);
+}
+size_t getMessageCount(MessageType type) { return g_messageStore.countOf(type); }
+void   clearMessages()                   { g_messageStore.clear(); }
+void   printStoreSummary()               { g_messageStore.printSummary(); }
+
+// ============================================================
+//  [3]  main() — wires the library to your capture layer
+// ============================================================
+
+int main() {
+std::cout << “=== Pattern 1: Plain Function Pointer ===\n\n”;
+
+```
+lib_registerWriter(writeSomething);
+std::cout << "\n";
+lib_start();
+
+printStoreSummary();
+
+std::cout << "\n--- Event messages ---\n";
+auto events = getMessages(MessageType::Event);
+for (size_t i = 0; i < events.size(); ++i) {
+    const auto& msg = events[i];
+    std::string payloadStr(msg.payload.begin(), msg.payload.end());
+    std::cout << "  [" << i << "]"
+              << "  magic=0x"   << std::hex << msg.pre.magic << std::dec
+              << "  seq="       << msg.header.sequence_id
+              << "  source="    << msg.header.source_id
+              << "  payload=\"" << payloadStr << "\"\n";
+}
+
+std::cout << "\n--- Telemetry messages ---\n";
+auto telemetry = getMessages(MessageType::Telemetry);
+for (size_t i = 0; i < telemetry.size(); ++i) {
+    const auto& msg = telemetry[i];
+    std::string payloadStr(msg.payload.begin(), msg.payload.end());
+    std::cout << "  [" << i << "]"
+              << "  magic=0x" << std::hex << msg.pre.magic << std::dec
+              << "  seq="     << msg.header.sequence_id
+              << "  payload=\"" << payloadStr << "\"\n";
+}
+
+return 0;
+```
+
+}
