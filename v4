@@ -1,0 +1,172 @@
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <vector>
+
+#pragma pack(push, 1)
+struct PreMessage {
+    uint32_t magic;           // offset  0 — 4 bytes
+    uint16_t version;         // offset  4 — 2 bytes
+    uint16_t flags;           // offset  6 — 2 bytes
+    uint32_t record_count;    // offset  8 — 4 bytes
+    uint32_t record_size;     // offset 12 — 4 bytes
+    uint64_t payload_bytes;   // offset 16 — 8 bytes
+};
+#pragma pack(pop)
+
+struct PayloadBody {
+    uint32_t sensor_id;
+    float    value;
+    uint32_t error_code;
+    uint64_t event_time_ns;
+    uint16_t unit;
+    uint16_t quality;
+};
+
+// Pack list of PayloadBody into a sequence<octet>
+std::vector<uint8_t> packBodies(const std::vector<PayloadBody>& bodies) {
+    const size_t totalBytes = bodies.size() * sizeof(PayloadBody);
+    std::vector<uint8_t> seq(totalBytes);
+
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        std::memcpy(
+            seq.data() + (i * sizeof(PayloadBody)),
+            &bodies[i],
+            sizeof(PayloadBody)
+        );
+    }
+
+    return seq;
+}
+
+// Unpack sequence<octet> back into list of PayloadBody
+std::vector<PayloadBody> unpackBodies(const std::vector<uint8_t>& seq) {
+    const size_t count = seq.size() / sizeof(PayloadBody);
+    std::vector<PayloadBody> bodies(count);
+
+    for (size_t i = 0; i < count; ++i) {
+        std::memcpy(
+            &bodies[i],
+            seq.data() + (i * sizeof(PayloadBody)),
+            sizeof(PayloadBody)
+        );
+    }
+
+    return bodies;
+}
+
+// Dump the raw sequence<octet> as hex + ASCII
+void dumpSequence(const std::vector<uint8_t>& seq) {
+    std::cout << "[SEQ] sequence<octet> — " << seq.size() << " bytes\n";
+    std::cout << std::hex << std::setfill('0');
+
+    for (size_t i = 0; i < seq.size(); i += 16) {
+        std::cout << "  " << std::setw(4) << i << "  ";
+
+        for (size_t j = 0; j < 16; ++j) {
+            if (i + j < seq.size())
+                std::cout << std::setw(2) << (int)seq[i + j] << " ";
+            else
+                std::cout << "   ";
+        }
+
+        std::cout << " | ";
+
+        for (size_t j = 0; j < 16 && i + j < seq.size(); ++j) {
+            uint8_t byte = seq[i + j];
+            std::cout << (char)(std::isprint(byte) ? byte : '.');
+        }
+
+        std::cout << "\n";
+    }
+
+    std::cout << std::dec << std::setfill(' ');
+}
+
+int main() {
+    std::vector<PayloadBody> bodies;
+
+    PayloadBody b1;
+    b1.sensor_id     = 1;
+    b1.value         = 98.6f;
+    b1.error_code    = 0;
+    b1.event_time_ns = 0x0000000006F818A1;
+    b1.unit          = 0;  // celsius
+    b1.quality       = 2;  // good
+    bodies.push_back(b1);
+
+    PayloadBody b2;
+    b2.sensor_id     = 2;
+    b2.value         = 3.3f;
+    b2.error_code    = 0;
+    b2.event_time_ns = 0x0000000006F818A2;
+    b2.unit          = 1;  // volts
+    b2.quality       = 2;
+    bodies.push_back(b2);
+
+    PayloadBody b3;
+    b3.sensor_id     = 3;
+    b3.value         = 1450.0f;
+    b3.error_code    = 0;
+    b3.event_time_ns = 0x0000000006F818A3;
+    b3.unit          = 2;  // rpm
+    b3.quality       = 1;  // uncertain
+    bodies.push_back(b3);
+
+    // Build PreMessage from the list
+    PreMessage pre;
+    pre.magic         = 0xDEADBEEF;
+    pre.version       = 1;
+    pre.flags         = 0x0001;
+    pre.record_count  = static_cast<uint32_t>(bodies.size());
+    pre.record_size   = sizeof(PayloadBody);
+    pre.payload_bytes = bodies.size() * sizeof(PayloadBody);
+
+    // Print PreMessage
+    std::cout << "=== PreMessage ===\n";
+    std::cout << "  magic=0x"       << std::hex << pre.magic << std::dec << "\n";
+    std::cout << "  version="       << pre.version       << "\n";
+    std::cout << "  flags=0x"       << std::hex << pre.flags << std::dec << "\n";
+    std::cout << "  record_count="  << pre.record_count  << "\n";
+    std::cout << "  record_size="   << pre.record_size   << "\n";
+    std::cout << "  payload_bytes=" << pre.payload_bytes << "\n";
+
+    // Print original PayloadBody list
+    std::cout << "\n=== PayloadBody list (original) ===\n";
+    for (size_t i = 0; i < bodies.size(); ++i) {
+        const auto& b = bodies[i];
+        std::cout << "  [" << i << "]"
+                  << "  sensor_id="     << b.sensor_id
+                  << "  value="         << b.value
+                  << "  error_code="    << b.error_code
+                  << "  event_time_ns=" << b.event_time_ns
+                  << "  unit="          << b.unit
+                  << "  quality="       << b.quality
+                  << "\n";
+    }
+
+    // Pack into sequence<octet>
+    std::vector<uint8_t> seq = packBodies(bodies);
+
+    std::cout << "\n=== Packed into sequence<octet> ===\n";
+    dumpSequence(seq);
+
+    // Unpack back out to prove the round trip
+    std::vector<PayloadBody> unpacked = unpackBodies(seq);
+
+    std::cout << "\n=== PayloadBody list (unpacked from sequence) ===\n";
+    for (size_t i = 0; i < unpacked.size(); ++i) {
+        const auto& b = unpacked[i];
+        std::cout << "  [" << i << "]"
+                  << "  sensor_id="     << b.sensor_id
+                  << "  value="         << b.value
+                  << "  error_code="    << b.error_code
+                  << "  event_time_ns=" << b.event_time_ns
+                  << "  unit="          << b.unit
+                  << "  quality="       << b.quality
+                  << "\n";
+    }
+
+    return 0;
+}
